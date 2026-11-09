@@ -47,3 +47,15 @@ This utility supports various features, including:
 *   Error handling for type mismatches and CSV format issues.
 
 For detailed examples demonstrating these features, error handling, and behavior with mismatched columns, **please refer to the `CsvDeserializerDemo.cs` script provided in the demonstration files.** These examples will guide you through the full capabilities of the `CsvDeserializer`.
+
+## Numbers and error handling
+
+* Built-in numeric conversions use `CultureInfo.InvariantCulture`. The decimal separator is `.`, so `1.5` remains `1.5` even under `de-DE`. Thousands separators and decimal commas are rejected.
+* Integers use `NumberStyles.Integer`; floating-point values use `NumberStyles.Float`. Surrounding whitespace, signs, and floating-point exponents are accepted. Overflow, `NaN`, and infinity are rejected.
+* Enums accept case-insensitive names, name combinations, and integers within the underlying type's range. Undefined integer values remain accepted for compatibility; invalid names and out-of-range values are errors.
+* Quotes may open only at the start of a cell. A closing quote must be followed by a delimiter or the end of the record; embedded quotes must be escaped as `""`. Syntax is checked even in unmapped columns and columns beyond the header.
+* Syntax and cell conversion errors immediately throw `CsvDeserializer.CsvParseException`, derived from `FormatException`. Inspect `RowNumber`, `ColumnNumber`, and `ColumnName` for the location and `InnerException` for the original cause. `ColumnName` is `null` while parsing headers or for columns without a header.
+
+Row and column numbers are one-based, including the header as row 1. Blank records count toward row numbers; line breaks inside quoted cells stay within the same CSV record. For example, `Name,Score\n"Alice"garbage,42` fails at `row 2, column 1 ('Name')`.
+
+Empty string cells default to `string.Empty`; set `PreserveStringMemberOnEmptyCsv = true` to keep their initializers. Empty non-string cells and missing columns keep their initializers. Custom converters control their own culture and validation policy; exceptions they throw also receive row and column context.

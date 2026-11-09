@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Reflection;
 
 /// <summary>
@@ -16,6 +17,26 @@ public static class CsvDeserializer
         Field,
         Property,
         Both
+    }
+
+    /// <summary>
+    /// Reports a CSV syntax or cell conversion error with its one-based record and column.
+    /// The header is record 1; blank records count, and quoted newlines stay in the same record.
+    /// </summary>
+    public sealed class CsvParseException : FormatException
+    {
+        public int RowNumber { get; }
+        public int ColumnNumber { get; }
+        public string ColumnName { get; }
+
+        internal CsvParseException(int rowNumber, int columnNumber, string columnName, Exception innerException)
+            : base($"CSV error at row {rowNumber}, column {columnNumber}" +
+                (columnName == null ? "" : $" ('{columnName}')") + $": {innerException.Message}", innerException)
+        {
+            RowNumber = rowNumber;
+            ColumnNumber = columnNumber;
+            ColumnName = columnName;
+        }
     }
 
     /// <summary>
@@ -81,27 +102,36 @@ public static class CsvDeserializer
             }
 
             var inQuotes = false;
+            var atFieldStart = true;
             var lineEnd = -1;
 
             for (var i = 0; i < _remaining.Length; i++)
             {
                 var c = _remaining[i];
 
-                if (c == '"')
+                if (inQuotes)
                 {
-                    if (i + 1 < _remaining.Length && _remaining[i + 1] == '"')
+                    if (c == '"')
                     {
-                        i++; // Skip escaped double quote (e.g., "")
-                    }
-                    else
-                    {
-                        inQuotes = !inQuotes;
+                        if (i + 1 < _remaining.Length && _remaining[i + 1] == '"')
+                            i++; // Only quotes inside a quoted field can be escaped.
+                        else
+                            inQuotes = false;
                     }
                 }
-                else if (!inQuotes && (c == '\n' || c == '\r'))
+                else if (c == '"' && atFieldStart)
+                {
+                    inQuotes = true;
+                    atFieldStart = false;
+                }
+                else if (c == '\n' || c == '\r')
                 {
                     lineEnd = i;
                     break;
+                }
+                else
+                {
+                    atFieldStart = c == Delimiter;
                 }
             }
 
@@ -138,122 +168,73 @@ public static class CsvDeserializer
     {
         private ReadOnlySpan<char> _remaining;
         private ReadOnlySpan<char> _currentColumn;
-        private bool _currentColumnIsQuoted;
+        private bool _hasMoreColumns;
 
         public ColumnEnumerator(ReadOnlySpan<char> csvRow)
         {
             _remaining = csvRow;
             _currentColumn = ReadOnlySpan<char>.Empty;
-            _currentColumnIsQuoted = false;
+            _hasMoreColumns = !csvRow.IsEmpty;
         }
 
         public readonly ReadOnlySpan<char> Current => _currentColumn;
-        public readonly bool CurrentColumnIsQuoted => _currentColumnIsQuoted;
 
         public bool MoveNext()
         {
-            if (_remaining.IsEmpty)
+            if (!_hasMoreColumns)
             {
                 _currentColumn = ReadOnlySpan<char>.Empty;
                 return false;
             }
 
-            _currentColumnIsQuoted = false;
-            var inQuotes = false;
-            var fieldEnd = -1;    // Index of the character that signifies the end of the current field.
-            var fieldStart = 0;   // Index where the actual field content starts (relevant for quoted fields).
-
-            if (_remaining.Length > 0 && _remaining[0] == '"')
+            if (!_remaining.IsEmpty && _remaining[0] == '"')
             {
-                inQuotes = true;
-                _currentColumnIsQuoted = true;
-                fieldStart = 1; // Content starts after the opening quote
+                for (var i = 1; i < _remaining.Length; i++)
+                {
+                    if (_remaining[i] != '"')
+                        continue;
+                    if (i + 1 < _remaining.Length && _remaining[i + 1] == '"')
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    var afterQuote = i + 1;
+                    if (afterQuote < _remaining.Length && _remaining[afterQuote] != Delimiter)
+                        throw new FormatException("Expected a delimiter or end of row after the closing quote.");
+
+                    _currentColumn = _remaining[1..i];
+                    _hasMoreColumns = afterQuote < _remaining.Length;
+                    _remaining = _hasMoreColumns ? _remaining[(afterQuote + 1)..] : ReadOnlySpan<char>.Empty;
+                    return true;
+                }
+                throw new FormatException("CSV format error: unmatched quotes.");
             }
 
-            for (var i = fieldStart; i < _remaining.Length; i++)
-            {
-                var c = _remaining[i];
-                if (inQuotes)
-                {
-                    if (c == '"')
-                    {
-                        if (i + 1 < _remaining.Length && _remaining[i + 1] == '"')
-                        {
-                            i++; // Skip escaped double quote
-                        }
-                        else
-                        {
-                            fieldEnd = i; // This is the closing quote for the field
-                            break;
-                        }
-                    }
-                }
-                else // Not inside a quoted field
-                {
-                    if (c == Delimiter)
-                    {
-                        fieldEnd = i; // Delimiter marks the end of the field
-                        break;
-                    }
-                }
-            }
+            var fieldEnd = _remaining.IndexOf(Delimiter);
+            _currentColumn = fieldEnd < 0 ? _remaining : _remaining[..fieldEnd];
+            if (_currentColumn.IndexOf('"') >= 0)
+                throw new FormatException("A quote in an unquoted field must be enclosed and escaped with double quotes.");
 
-            if (fieldEnd == -1) // Field extends to the end of the line
-            {
-                if (_currentColumnIsQuoted)
-                {
-                    // A quoted field must end with a quote.
-                    if (_remaining.Length > fieldStart && _remaining[^1] == '"') // ^1 is C# 8.0 index from end
-                    {
-                        _currentColumn = _remaining[fieldStart..^1]; // Exclude the surrounding quotes
-                    }
-                    else
-                    {
-                        // Malformed: started with a quote but doesn't end with one or is unclosed.
-                        throw new FormatException("CSV format error: unmatched quotes.");
-                    }
-                }
-                else
-                {
-                    _currentColumn = _remaining;
-                }
-                _remaining = ReadOnlySpan<char>.Empty; // All content consumed
-            }
-            else // Delimiter or closing quote for the field was found
-            {
-                if (_currentColumnIsQuoted)
-                {
-                    // fieldEnd is the position of the closing quote
-                    _currentColumn = _remaining[fieldStart..fieldEnd];
-
-                    // After a closing quote, the next character should ideally be a delimiter or end of line.
-                    int charAfterQuoteIdx = fieldEnd + 1;
-                    if (charAfterQuoteIdx < _remaining.Length && _remaining[charAfterQuoteIdx] == Delimiter)
-                    {
-                        _remaining = _remaining[(charAfterQuoteIdx + 1)..]; // Advance past the delimiter
-                    }
-                    else // End of line, or no delimiter found after quoted field.
-                    {
-                        _remaining = ReadOnlySpan<char>.Empty;
-                    }
-                }
-                else
-                {
-                    // fieldEnd is the position of the delimiter
-                    _currentColumn = _remaining[..fieldEnd];
-                    _remaining = _remaining[(fieldEnd + 1)..]; // Advance past the delimiter
-                }
-            }
-
-            // Handles cases like an empty line or trailing commas to prevent infinite loops.
-            // If _remaining became empty, _currentColumn is empty (e.g. after a trailing comma),
-            // it was not quoted, and we didn't advance fieldStart or find a fieldEnd, then stop.
-            if (_remaining.IsEmpty && _currentColumn.IsEmpty && !_currentColumnIsQuoted && fieldStart == 0 && fieldEnd == -1)
-                return false;
+            // A delimiter leaves one more column, even when its content is empty.
+            _hasMoreColumns = fieldEnd >= 0;
+            _remaining = _hasMoreColumns ? _remaining[(fieldEnd + 1)..] : ReadOnlySpan<char>.Empty;
             return true;
         }
 
         public readonly ColumnEnumerator GetEnumerator() => this;
+    }
+
+    private static bool MoveNextColumn(ref ColumnEnumerator enumerator, int rowNumber, int columnNumber, string columnName)
+    {
+        try
+        {
+            return enumerator.MoveNext();
+        }
+        catch (FormatException exception)
+        {
+            throw new CsvParseException(rowNumber, columnNumber, columnName, exception);
+        }
     }
     #endregion
 
@@ -355,28 +336,30 @@ public static class CsvDeserializer
         }
         else if (memberType == typeof(int))
         {
-            if (int.TryParse(dataFromCsv, out var intValue)) // Uses current culture
+            if (int.TryParse(dataFromCsv, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intValue))
                 accessor.SetValue(instance, intValue);
             else
                 throw new FormatException($"Failed to parse '{dataFromCsv.ToString()}' as int.");
         }
         else if (memberType == typeof(long))
         {
-            if (long.TryParse(dataFromCsv, out var longValue))
+            if (long.TryParse(dataFromCsv, NumberStyles.Integer, CultureInfo.InvariantCulture, out var longValue))
                 accessor.SetValue(instance, longValue);
             else
                 throw new FormatException($"Failed to parse '{dataFromCsv.ToString()}' as long.");
         }
         else if (memberType == typeof(float))
         {
-            if (float.TryParse(dataFromCsv, out var floatValue))
+            if (float.TryParse(dataFromCsv, NumberStyles.Float, CultureInfo.InvariantCulture, out var floatValue)
+                && !float.IsNaN(floatValue) && !float.IsInfinity(floatValue))
                 accessor.SetValue(instance, floatValue);
             else
                 throw new FormatException($"Failed to parse '{dataFromCsv.ToString()}' as float.");
         }
         else if (memberType == typeof(double))
         {
-            if (double.TryParse(dataFromCsv, out var doubleValue))
+            if (double.TryParse(dataFromCsv, NumberStyles.Float, CultureInfo.InvariantCulture, out var doubleValue)
+                && !double.IsNaN(doubleValue) && !double.IsInfinity(doubleValue))
                 accessor.SetValue(instance, doubleValue);
             else
                 throw new FormatException($"Failed to parse '{dataFromCsv.ToString()}' as double.");
@@ -390,14 +373,14 @@ public static class CsvDeserializer
         }
         else if (memberType == typeof(byte))
         {
-            if (byte.TryParse(dataFromCsv, out var byteValue))
+            if (byte.TryParse(dataFromCsv, NumberStyles.Integer, CultureInfo.InvariantCulture, out var byteValue))
                 accessor.SetValue(instance, byteValue);
             else
                 throw new FormatException($"Failed to parse '{dataFromCsv.ToString()}' as byte.");
         }
         else if (memberType == typeof(short))
         {
-            if (short.TryParse(dataFromCsv, out var shortValue))
+            if (short.TryParse(dataFromCsv, NumberStyles.Integer, CultureInfo.InvariantCulture, out var shortValue))
                 accessor.SetValue(instance, shortValue);
             else
                 throw new FormatException($"Failed to parse '{dataFromCsv.ToString()}' as short.");
@@ -405,46 +388,11 @@ public static class CsvDeserializer
         else if (memberType.IsEnum)
         {
             var fieldStringValue = GetUnescapedString(dataFromCsv);
-            bool parsedSuccessfully = false;
-
-            // First, try parsing the string value as an enum member name (case-insensitive).
-            if (!string.IsNullOrEmpty(fieldStringValue))
-            {
-                if (Enum.TryParse(memberType, fieldStringValue, true, out var enumValueAsObject))
-                {
-                    accessor.SetValue(instance, enumValueAsObject);
-                    parsedSuccessfully = true;
-                }
-            }
-
-            // If parsing by name failed or the string was empty, try parsing as underlying numeric value.
-            // This 'else' block was part of the user's original structure for enum parsing.
-            if (!parsedSuccessfully) // This condition ensures numeric parsing is an alternative.
-            {
-                var underlyingEnumType = Enum.GetUnderlyingType(memberType);
-                if (underlyingEnumType == typeof(int))
-                {
-                    if (int.TryParse(dataFromCsv, out var numericValue))
-                    {
-                        accessor.SetValue(instance, Enum.ToObject(memberType, numericValue));
-                        // parsedSuccessfully = true; // Can be set if tracking is needed beyond this block
-                    }
-                }
-                else if (underlyingEnumType == typeof(long))
-                {
-                    if (long.TryParse(dataFromCsv, out var numericValue))
-                    {
-                        accessor.SetValue(instance, Enum.ToObject(memberType, numericValue));
-                        // parsedSuccessfully = true;
-                    }
-                }
-                else
-                {
-                    throw new NotSupportedException($"Enum '{memberType.FullName}' with underlying type '{underlyingEnumType.FullName}' is not supported for default numeric parsing.");
-                }
-            }
-            // If !parsedSuccessfully after all attempts, the member remains unchanged or default.
-            // Add logging here if desired for parse failures.
+            // Retain case-insensitive names, flag combinations and underlying integer values.
+            if (Enum.TryParse(memberType, fieldStringValue, true, out var enumValue))
+                accessor.SetValue(instance, enumValue);
+            else
+                throw new FormatException($"Failed to parse '{fieldStringValue}' as enum '{memberType.FullName}'.");
         }
         else
         {
@@ -452,12 +400,31 @@ public static class CsvDeserializer
         }
     }
 
+    private static void SetColumnValue(object instance, Accessor accessor, ReadOnlySpan<char> dataFromCsv,
+        int rowNumber, int columnNumber, string columnName)
+    {
+        try
+        {
+            if (!dataFromCsv.IsEmpty)
+                SetValue(instance, accessor, dataFromCsv);
+            else if (accessor.MemberType == typeof(string) && !PreserveStringMemberOnEmptyCsv)
+                accessor.SetValue(instance, string.Empty);
+        }
+        catch (Exception exception)
+        {
+            throw new CsvParseException(rowNumber, columnNumber, columnName, exception);
+        }
+    }
+
     /// <summary>
     /// Deserializes CSV content into a list of objects of type T.
+    /// Built-in numbers use InvariantCulture with no thousands separators and finite floating-point values.
+    /// Invalid CSV syntax or nonempty cell conversion failures stop deserialization with location details.
     /// </summary>
     /// <typeparam name="T">The type of objects to create. Must be a class with a parameterless constructor.</typeparam>
     /// <param name="csvContent">The string containing the CSV data.</param>
     /// <returns>A list of deserialized objects of type T.</returns>
+    /// <exception cref="CsvParseException">CSV syntax or cell conversion is invalid.</exception>
     public static List<T> Deserialize<T>(string csvContent) where T : class, new()
     {
         var result = new List<T>();
@@ -485,6 +452,7 @@ public static class CsvDeserializer
 
         // This list will hold accessors in the order of CSV headers.
         var orderedAccessors = new List<Accessor>();
+        var columnNames = new List<string>();
 
         var rowEnumerator = new RowEnumerator(csvContent.AsSpan());
         if (!rowEnumerator.MoveNext()) // No rows at all, or empty content
@@ -492,24 +460,21 @@ public static class CsvDeserializer
 
         // Process the first row as header
         var headerEnumerator = new ColumnEnumerator(rowEnumerator.Current);
-        while (headerEnumerator.MoveNext())
+        while (MoveNextColumn(ref headerEnumerator, 1, orderedAccessors.Count + 1, null))
         {
-            var columnHeaderSpan = headerEnumerator.Current;
-            if (columnHeaderSpan.IsEmpty) // Handle empty header names if necessary (e.g., add null accessor)
-            {
-                orderedAccessors.Add(null);
-                continue;
-            }
-
-            var memberName = columnHeaderSpan.ToString(); // Allocation for header name (processed once)
+            var memberName = GetUnescapedString(headerEnumerator.Current); // Process headers once.
+            columnNames.Add(memberName.Length == 0 ? null : memberName);
             // Find corresponding member in target type (case-insensitive)
-            var accessor = membersInTarget.Find(f => f.Name.Equals(memberName, StringComparison.OrdinalIgnoreCase));
+            var accessor = memberName.Length == 0 ? null :
+                membersInTarget.Find(f => f.Name.Equals(memberName, StringComparison.OrdinalIgnoreCase));
             orderedAccessors.Add(accessor); // Add found accessor (or null if not found)
         }
 
         // Process data rows
+        var rowNumber = 1;
         while (rowEnumerator.MoveNext())
         {
+            rowNumber++;
             var rowSpan = rowEnumerator.Current;
             if (rowSpan.IsEmpty)
                 continue; // Skip empty lines between data rows
@@ -518,31 +483,16 @@ public static class CsvDeserializer
             var instance = new T(); // Create a new instance of the target type for each row
             var fieldIndex = 0;
 
-            // Iterate through columns in the current data row
-            while (columnEnumerator.MoveNext() && fieldIndex < orderedAccessors.Count)
+            // Validate every column, including unmapped columns and columns beyond the header.
+            while (true)
             {
-                var columnDataSpan = columnEnumerator.Current;
-                Accessor currentAccessor = orderedAccessors[fieldIndex];
+                var columnName = fieldIndex < columnNames.Count ? columnNames[fieldIndex] : null;
+                if (!MoveNextColumn(ref columnEnumerator, rowNumber, fieldIndex + 1, columnName))
+                    break;
 
-                if (currentAccessor != null) // If there's a mapped member for this CSV column
-                {
-                    if (!columnDataSpan.IsEmpty)
-                    {
-                        SetValue(instance, currentAccessor, columnDataSpan);
-                    }
-                    else // CSV cell is empty
-                    {
-                        // Handle empty string fields based on PreserveStringMemberOnEmptyCsv setting
-                        if (currentAccessor.MemberType == typeof(string))
-                        {
-                            if (!PreserveStringMemberOnEmptyCsv) // Default is false, so this block executes by default
-                            {
-                                currentAccessor.SetValue(instance, string.Empty);
-                            }
-                            // If PreserveStringMemberOnEmptyCsv is true, do nothing; C# initialized value is kept.
-                        }
-                    }
-                }
+                var accessor = fieldIndex < orderedAccessors.Count ? orderedAccessors[fieldIndex] : null;
+                if (accessor != null)
+                    SetColumnValue(instance, accessor, columnEnumerator.Current, rowNumber, fieldIndex + 1, columnName);
                 fieldIndex++;
             }
             result.Add(instance);
